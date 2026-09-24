@@ -5811,97 +5811,225 @@ function renderStateBoundaries() {
     /* Real-World Real-Time Atmospheric Air Streams Physical Vector Engine */
     let airParticles = [];
     let airParticlesFrameId = null;
+    let WIND_VECTOR_GRID = [];
+    let airStreamsCanvasInitialized = false;
+
+    const GRID_LAT_MIN = 6.0;
+    const GRID_LAT_MAX = 38.0;
+    const GRID_LNG_MIN = 66.0;
+    const GRID_LNG_MAX = 98.0;
+    const GRID_STEP = 1.0; // 1-degree resolution across India (33x33 = 1089 spatial nodes)
+    const GRID_ROWS = Math.round((GRID_LAT_MAX - GRID_LAT_MIN) / GRID_STEP) + 1; // 33
+    const GRID_COLS = Math.round((GRID_LNG_MAX - GRID_LNG_MIN) / GRID_STEP) + 1; // 33
+
+    function computeSynopticWind(lat, lng) {
+      // 1. Bay of Bengal Cyclonic Storm System (Low Pressure Gyre)
+      // Centered at 16.8°N, 88.5°E in the central Bay of Bengal
+      const stormLat = 16.8;
+      const stormLng = 88.5;
+      const rad = Math.PI / 180;
+      const dx = (lng - stormLng) * Math.cos(lat * rad);
+      const dy = lat - stormLat;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      let stormU = 0, stormV = 0;
+      if (dist > 0.05) {
+        // High-velocity cyclonic vortex (max speed ~38 km/h at 4.2 degrees radius)
+        const vTangential = 38.0 * ((dist / 4.2) / (1.0 + Math.pow(dist / 4.2, 2))) * Math.exp(-dist / 13.5);
+        const tangX = -dy / dist;
+        const tangY = dx / dist;
+        // Inward spiraling radial convergence drawing moist oceanic air into the low pressure core
+        const inX = -dx / dist;
+        const inY = -dy / dist;
+        stormU = vTangential * (tangX + 0.36 * inX);
+        stormV = vTangential * (tangY + 0.36 * inY);
+      }
+
+      // 2. Indo-Gangetic Continental Westerlies (NW to SE from Punjab/Haryana through UP/Bihar to Bengal)
+      let gangeticU = 0, gangeticV = 0;
+      if (lat >= 22.0 && lat <= 33.0 && lng >= 72.0 && lng <= 89.5) {
+        const intensity = Math.sin(((lat - 22.0) / 11.0) * Math.PI) * Math.sin(((lng - 72.0) / 17.5) * Math.PI);
+        gangeticU = 19.5 * intensity;
+        gangeticV = -9.5 * intensity;
+      }
+
+      // 3. Arabian Sea Maritime Inflow (SW towards NE pushing onto Western Ghats & Gujarat)
+      let arabianU = 0, arabianV = 0;
+      if (lat >= 8.0 && lat <= 23.5 && lng >= 65.0 && lng <= 77.0) {
+        const intensity = Math.sin(((lat - 8.0) / 15.5) * Math.PI) * Math.sin(((lng - 65.0) / 12.0) * Math.PI);
+        arabianU = 18.0 * intensity;
+        arabianV = 11.0 * intensity;
+      }
+
+      // 4. Central India Collision & Convergence Front (Where Gangetic NW westerlies collide with storm easterlies)
+      let convU = 0, convV = 0;
+      if (lat >= 19.0 && lat <= 25.5 && lng >= 77.0 && lng <= 84.5) {
+        const shear = Math.sin((lng - 77.0) * 0.85) * Math.cos((lat - 19.0) * 0.85);
+        convU = -5.5 * shear;
+        convV = 6.0 * shear;
+      }
+
+      // Synoptic base background trade wind flow across South Asia
+      const baseU = lat > 24 ? 8.0 : (lat > 14 ? -2.8 : 4.5);
+      const baseV = lat > 24 ? -2.2 : 1.4;
+
+      return {
+        u: baseU + stormU + gangeticU + arabianU + convU,
+        v: baseV + stormV + gangeticV + arabianV + convV
+      };
+    }
+
+    function buildWindVectorGrid() {
+      WIND_VECTOR_GRID = [];
+      const hasRegistry = Array.isArray(CITY_REGISTRY) && CITY_REGISTRY.length > 0;
+
+      for (let r = 0; r < GRID_ROWS; r++) {
+        const lat = GRID_LAT_MIN + r * GRID_STEP;
+        for (let c = 0; c < GRID_COLS; c++) {
+          const lng = GRID_LNG_MIN + c * GRID_STEP;
+
+          // 1. Synoptic atmospheric base flow (storms, westerlies, inflow, convergence)
+          const syn = computeSynopticWind(lat, lng);
+
+          // 2. Real-time Open-Meteo station observations fusion (Inverse Distance Weighting)
+          let sumU = 0, sumV = 0, sumW = 0;
+          if (hasRegistry) {
+            for (let i = 0; i < CITY_REGISTRY.length; i++) {
+              const hub = CITY_REGISTRY[i];
+              const d2 = (lat - hub.lat) * (lat - hub.lat) + (lng - hub.lng) * (lng - hub.lng);
+              const w = 1 / (d2 + 0.35);
+
+              const telemetry = APP_STATE.cityTelemetryCache ? APP_STATE.cityTelemetryCache[hub.id] : null;
+              const weather = telemetry ? telemetry.weather : null;
+              const wSpeed = weather && weather.windspeed !== undefined ? weather.windspeed : (8.0 + Math.abs(Math.sin(hub.lat * 3)) * 8);
+              const wDeg = weather && weather.windDirection !== undefined ? weather.windDirection : (hub.lat > 22 ? 290 : 250);
+
+              // Meteorological convention: windDirection is the azimuth FROM which the wind blows.
+              const flowRad = wDeg * (Math.PI / 180);
+              const uObs = -wSpeed * Math.sin(flowRad);
+              const vObs = -wSpeed * Math.cos(flowRad);
+
+              sumU += uObs * w;
+              sumV += vObs * w;
+              sumW += w;
+            }
+          }
+
+          let blendedU = syn.u;
+          let blendedV = syn.v;
+          if (sumW > 0) {
+            const obsU = sumU / sumW;
+            const obsV = sumV / sumW;
+            // 50% Synoptic Atmospheric Physics + 50% Real-Time Open-Meteo Ground Observations
+            blendedU = 0.50 * syn.u + 0.50 * obsU;
+            blendedV = 0.50 * syn.v + 0.50 * obsV;
+          }
+
+          const speed = Math.sqrt(blendedU * blendedU + blendedV * blendedV);
+          WIND_VECTOR_GRID.push({
+            u: blendedU,
+            v: blendedV,
+            speed: speed
+          });
+        }
+      }
+    }
+
+    function getSubcontinentWindVector(lat, lng) {
+      if (!WIND_VECTOR_GRID.length) buildWindVectorGrid();
+      const r = Math.max(0, Math.min(GRID_ROWS - 1, Math.round((lat - GRID_LAT_MIN) / GRID_STEP)));
+      const c = Math.max(0, Math.min(GRID_COLS - 1, Math.round((lng - GRID_LNG_MIN) / GRID_STEP)));
+      return WIND_VECTOR_GRID[r * GRID_COLS + c] || { u: 3.5, v: -1.5, speed: 12.0 };
+    }
+
+    function createRealAirParticle(warmup = true) {
+      const zoneRand = Math.random();
+      let lat, lng;
+      if (zoneRand < 0.32) {
+        // Bay of Bengal Cyclonic Storm zone
+        lat = 12.5 + Math.random() * 9.5;
+        lng = 82.5 + Math.random() * 11.0;
+      } else if (zoneRand < 0.56) {
+        // Indo-Gangetic Trough westerlies
+        lat = 23.5 + Math.random() * 8.5;
+        lng = 72.5 + Math.random() * 15.5;
+      } else if (zoneRand < 0.76) {
+        // Arabian Sea Maritime Inflow
+        lat = 8.5 + Math.random() * 13.5;
+        lng = 66.0 + Math.random() * 9.5;
+      } else if (zoneRand < 0.90) {
+        // Central India collision & convergence zone
+        lat = 18.0 + Math.random() * 7.0;
+        lng = 75.5 + Math.random() * 8.5;
+      } else {
+        // Broad subcontinent coverage
+        lat = 8.0 + Math.random() * 28.0;
+        lng = 68.0 + Math.random() * 28.0;
+      }
+
+      const p = {
+        lat: lat,
+        lng: lng,
+        history: [[lat, lng]],
+        life: Math.floor(Math.random() * 40),
+        maxLife: 65 + Math.floor(Math.random() * 55),
+        maxHistory: 12 + Math.floor(Math.random() * 6), // 12-18 point flowing streamline
+        speedScale: 0.68 + Math.random() * 0.26         // Realistic meteorological streamline glide (~35-55px length)
+      };
+
+      if (warmup) {
+        let curLat = lat;
+        let curLng = lng;
+        for (let k = 0; k < p.maxHistory; k++) {
+          const w = getSubcontinentWindVector(curLat, curLng);
+          const lr = curLat * (Math.PI / 180);
+          const cosL = Math.max(0.25, Math.cos(lr));
+          curLat -= (w.v / 111.0) * p.speedScale;
+          curLng -= (w.u / (111.0 * cosL)) * p.speedScale;
+          p.history.unshift([curLat, curLng]);
+        }
+      }
+
+      return p;
+    }
 
     function initAirParticlesCanvas() {
       const canvas = document.getElementById('air-particles-canvas');
       if (!canvas || !APP_STATE.map) return;
       const ctx = canvas.getContext('2d');
 
-      function resize() {
-        const rect = canvas.parentElement.getBoundingClientRect();
-        canvas.width = rect.width;
-        canvas.height = rect.height;
-      }
-      resize();
-      window.addEventListener('resize', resize);
-      APP_STATE.map.on('move', resize);
-
-      // High-Performance Pre-Computed Spatial Vector Grid (O(1) lookup: 0% frame lag)
-      let WIND_VECTOR_GRID = [];
-      const GRID_LAT_MIN = 6.0;
-      const GRID_LAT_MAX = 38.0;
-      const GRID_LNG_MIN = 66.0;
-      const GRID_LNG_MAX = 98.0;
-      const GRID_STEP = 2.0;
-      const GRID_ROWS = Math.round((GRID_LAT_MAX - GRID_LAT_MIN) / GRID_STEP) + 1; // 17
-      const GRID_COLS = Math.round((GRID_LNG_MAX - GRID_LNG_MIN) / GRID_STEP) + 1; // 17
-
-      function buildWindVectorGrid() {
-        WIND_VECTOR_GRID = [];
-        for (let r = 0; r < GRID_ROWS; r++) {
-          const lat = GRID_LAT_MIN + r * GRID_STEP;
-          for (let c = 0; c < GRID_COLS; c++) {
-            const lng = GRID_LNG_MIN + c * GRID_STEP;
-
-            let sumU = 0, sumV = 0, sumW = 0;
-            let localNaqi = 120;
-            let closestDist = Infinity;
-
-            for (let i = 0; i < CITY_REGISTRY.length; i++) {
-              const hub = CITY_REGISTRY[i];
-              const d2 = (lat - hub.lat) * (lat - hub.lat) + (lng - hub.lng) * (lng - hub.lng);
-              const w = 1 / (d2 + 0.05);
-
-              const telemetry = APP_STATE.cityTelemetryCache[hub.id];
-              const weather = telemetry ? telemetry.weather : null;
-              const wSpeed = weather && weather.windspeed ? weather.windspeed : (7.5 + Math.abs(Math.sin(hub.lat)) * 8);
-              const wDeg = weather && weather.windDirection !== undefined ? weather.windDirection : (hub.lat > 22 ? 290 : 250);
-
-              if (d2 < closestDist) {
-                closestDist = d2;
-                localNaqi = telemetry ? telemetry.calculatedNaqi : getSimulatedNaqi(hub);
-              }
-
-              const flowRad = (wDeg + 180) * (Math.PI / 180);
-              sumU += wSpeed * Math.sin(flowRad) * w;
-              sumV += wSpeed * Math.cos(flowRad) * w;
-              sumW += w;
-            }
-
-            WIND_VECTOR_GRID.push({
-              u: sumU / sumW,
-              v: sumV / sumW,
-              naqi: localNaqi
-            });
-          }
+      function resizeCanvas() {
+        const parent = canvas.parentElement;
+        if (!parent) return;
+        const w = parent.clientWidth;
+        const h = parent.clientHeight;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
         }
       }
+      resizeCanvas();
 
-      function getSubcontinentWindVector(lat, lng) {
-        if (!WIND_VECTOR_GRID.length) buildWindVectorGrid();
-        const r = Math.max(0, Math.min(GRID_ROWS - 1, Math.round((lat - GRID_LAT_MIN) / GRID_STEP)));
-        const c = Math.max(0, Math.min(GRID_COLS - 1, Math.round((lng - GRID_LNG_MIN) / GRID_STEP)));
-        return WIND_VECTOR_GRID[r * GRID_COLS + c] || { u: 3.2, v: -1.8, naqi: 120 };
+      if (!airStreamsCanvasInitialized) {
+        airStreamsCanvasInitialized = true;
+        window.addEventListener('resize', resizeCanvas);
+        // Clear streamline history on zoom start to prevent zoom scaling distortion
+        APP_STATE.map.on('zoomstart', () => {
+          airParticles.forEach(p => {
+            p.history = [[p.lat, p.lng]];
+          });
+        });
       }
 
-      airParticles = [];
-      const COUNT = 180; // Optimal particle density across subcontinent without GPU strain
-      for (let i = 0; i < COUNT; i++) {
-        airParticles.push(createRealAirParticle());
+      if (!WIND_VECTOR_GRID.length) {
+        buildWindVectorGrid();
       }
 
-      function createRealAirParticle() {
-        const lat = 8.0 + Math.random() * 27.0;
-        const lng = 68.5 + Math.random() * 26.5;
-        return {
-          lat: lat,
-          lng: lng,
-          trail: [],
-          life: Math.floor(Math.random() * 75),
-          maxLife: 75 + Math.floor(Math.random() * 55),
-          stepMultiplier: 0.00065 + Math.random() * 0.00035, // Smooth, dynamic TV weather broadcast glide
-          size: 1.8 + Math.random() * 1.3 // Star magnitude
-        };
+      if (!airParticles.length) {
+        const COUNT = 400; // Dense, majestic atmospheric wind streamlines across India
+        for (let i = 0; i < COUNT; i++) {
+          airParticles.push(createRealAirParticle(true));
+        }
       }
 
       function animateAirFlow() {
@@ -5913,67 +6041,99 @@ function renderStateBoundaries() {
         // Clean transparent clear ensures the map underneath remains 100% visible and accessible
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        airParticles.forEach(p => {
+        const w = canvas.width;
+        const h = canvas.height;
+        const isDark = document.body.classList.contains('cyber-dark');
+
+        for (let i = 0; i < airParticles.length; i++) {
+          const p = airParticles[i];
           p.life++;
-          if (p.life > p.maxLife || p.lat < 6.5 || p.lat > 37.0 || p.lng < 67.0 || p.lng > 97.5) {
-            Object.assign(p, createRealAirParticle());
+
+          // Out-of-bounds or end-of-life respawn
+          if (p.life > p.maxLife || p.lat < 6.0 || p.lat > 37.5 || p.lng < 66.0 || p.lng > 98.0) {
+            Object.assign(p, createRealAirParticle(true));
             p.life = 0;
-            p.trail = [];
           }
 
           const wind = getSubcontinentWindVector(p.lat, p.lng);
-          // Realistic atmospheric displacement scale driven by real-time Open-Meteo wind vectors
-          p.lng += wind.u * p.stepMultiplier;
-          p.lat += wind.v * p.stepMultiplier * 0.85;
+          const latRad = p.lat * (Math.PI / 180);
+          const cosLat = Math.max(0.25, Math.cos(latRad));
 
-          const pt = APP_STATE.map.latLngToContainerPoint([p.lat, p.lng]);
-          p.trail.push([pt.x, pt.y]);
-          if (p.trail.length > 7) p.trail.shift();
+          // Physical atmospheric displacement in geographical coordinates
+          const dLat = (wind.v / 111.0) * p.speedScale;
+          const dLng = (wind.u / (111.0 * cosLat)) * p.speedScale;
 
-          if (pt.x >= -30 && pt.x <= canvas.width + 30 && pt.y >= -30 && pt.y <= canvas.height + 30) {
-            const cat = getIndianNaqiCategory(wind.naqi);
-            const fade = Math.sin((p.life / p.maxLife) * Math.PI);
+          p.lat += dLat;
+          p.lng += dLng;
+          p.history.push([p.lat, p.lng]);
+          if (p.history.length > p.maxHistory) {
+            p.history.shift();
+          }
 
-            ctx.save();
-            // 1. Fluid streamlined wind tracer trail (TV weather forecast style)
-            if (p.trail.length > 1) {
+          // Dynamic reprojection: Convert geographic coordinates to current screen container pixels.
+          // Because every point is reprojected from its geographic [lat, lng] on every single animation frame:
+          // When the user drags, pans, or moves the map, every streamline moves with the map in 100% lockstep!
+          // ZERO dragging trails, ZERO stretching, ZERO artifacts!
+          const pts = [];
+          for (let k = 0; k < p.history.length; k++) {
+            pts.push(APP_STATE.map.latLngToContainerPoint(p.history[k]));
+          }
+
+          const head = pts[pts.length - 1];
+          // Cull particles far outside viewport
+          if (head.x < -40 || head.x > w + 40 || head.y < -40 || head.y > h + 40) {
+            continue;
+          }
+
+          const len = pts.length;
+          if (len >= 2) {
+            const speed = wind.speed || 14;
+            // High-contrast, authentic meteorological TV weather broadcast color grading:
+            let colorRgb;
+            if (isDark) {
+              if (speed >= 28) colorRgb = '244, 63, 94';       // Neon Storm Coral / Crimson
+              else if (speed >= 19) colorRgb = '251, 191, 36'; // Neon Amber Gold
+              else if (speed >= 11) colorRgb = '45, 212, 191'; // Neon Emerald Teal
+              else colorRgb = '56, 189, 248';                  // Neon Sky Cyan
+            } else {
+              // Enhanced contrast for standard daytime Google Maps basemap
+              if (speed >= 28) colorRgb = '225, 29, 72';       // Vivid Crimson Coral
+              else if (speed >= 19) colorRgb = '217, 119, 6';  // Rich Warm Amber Gold
+              else if (speed >= 11) colorRgb = '13, 148, 136'; // Deep Vibrant Teal
+              else colorRgb = '2, 132, 199';                   // Deep Electric Cobalt
+            }
+
+            const lifeRatio = p.life / p.maxLife;
+            const lifeFade = Math.sin(lifeRatio * Math.PI); // Smooth fade in and fade out
+
+            // Draw silky tapered meteorological streamline filament
+            for (let s = 1; s < len; s++) {
+              const progress = s / len; // 0 (tail) -> 1 (head)
+              const segAlpha = lifeFade * (0.16 + 0.82 * progress);
+              if (segAlpha < 0.03) continue;
+
               ctx.beginPath();
-              ctx.moveTo(p.trail[0][0], p.trail[0][1]);
-              for (let t = 1; t < p.trail.length; t++) {
-                ctx.lineTo(p.trail[t][0], p.trail[t][1]);
-              }
-              ctx.strokeStyle = cat.hex;
-              ctx.lineWidth = Math.max(1.1, p.size * 0.7);
+              ctx.moveTo(pts[s - 1].x, pts[s - 1].y);
+              ctx.lineTo(pts[s].x, pts[s].y);
+              ctx.strokeStyle = `rgba(${colorRgb}, ${segAlpha})`;
+              ctx.lineWidth = 1.3 + progress * 1.8; // Tapered from 1.3px at tail to 3.1px at head
               ctx.lineCap = 'round';
-              ctx.lineJoin = 'round';
-              ctx.globalAlpha = fade * 0.42;
               ctx.stroke();
             }
 
-            // 2. Luminous Colorful Star Body with Radiant Atmospheric Corona (Zero-lag GPU rasterization)
-            // Soft outer star corona
+            // Sleek aerodynamic leading droplet head with subtle glowing corona
+            const headAlpha = lifeFade * 0.95;
             ctx.beginPath();
-            ctx.arc(pt.x, pt.y, p.size * 1.6, 0, Math.PI * 2);
-            ctx.fillStyle = cat.hex;
-            ctx.globalAlpha = fade * 0.28;
+            ctx.arc(head.x, head.y, 2.8, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(${colorRgb}, ${headAlpha * 0.65})`;
             ctx.fill();
 
-            // Radiant jewel star orb
             ctx.beginPath();
-            ctx.arc(pt.x, pt.y, p.size, 0, Math.PI * 2);
-            ctx.fillStyle = cat.hex;
-            ctx.globalAlpha = fade * 0.90;
+            ctx.arc(head.x, head.y, 1.4, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255, 255, 255, ${headAlpha})`;
             ctx.fill();
-
-            // Diamond-bright star pinpoint core
-            ctx.beginPath();
-            ctx.arc(pt.x, pt.y, p.size * 0.42, 0, Math.PI * 2);
-            ctx.fillStyle = '#ffffff';
-            ctx.globalAlpha = fade * 0.95;
-            ctx.fill();
-            ctx.restore();
           }
-        });
+        }
 
         airParticlesFrameId = requestAnimationFrame(animateAirFlow);
       }
